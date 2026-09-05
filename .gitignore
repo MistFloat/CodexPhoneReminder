@@ -1,0 +1,17 @@
+**/bin/
+**/obj/
+**/data/
+.vs/
+.appdata/
+.codex-docs-cache/
+.openai-docs-cache/
+.verify/
+
+# Local Gradle distribution (not part of the repo)
+/gradle-9.5.0/
+
+# Android build outputs & local caches
+**/build/
+**/.gradle*/
+android/.android-sdk/
+android/local.properties
