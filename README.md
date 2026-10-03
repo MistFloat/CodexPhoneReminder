@@ -2,6 +2,8 @@
 
 一个让 Android 手机远程跟踪、提醒和操控电脑上 Codex 任务的个人工具。Windows 本地代理读取 Codex CLI/GUI 共享的结构化会话记录,Android 客户端查看任务、发送下一条指令,并由前台服务在关键事件发生时及时提醒。
 
+> **最新版本 v0.8.0** · [下载 Android APK](https://github.com/MistFloat/CodexPhoneReminder/releases/download/v0.8.0/CodexPhoneReminder-v0.8.0-android.apk) · [下载 Windows Agent](https://github.com/MistFloat/CodexPhoneReminder/releases/download/v0.8.0/CodexPhoneReminder-agent-v0.8.0-win-x64.zip) · [Release Notes](https://github.com/MistFloat/CodexPhoneReminder/releases/tag/v0.8.0)
+
 ## 项目背景:从局域网到云中继
 
 本项目最初按 [PRD](./PRD.md) 设计为**纯局域网**互传 + 消息提醒:电脑跑一个本地 Agent,手机通过同一校园 Wi-Fi 直连,不依赖任何公网服务、内网穿透、域名或 VPS。MVP 阶段只考虑局域网直连,目标用户是同时使用 Codex 处理多个项目、无法持续盯电脑的个人开发者。
