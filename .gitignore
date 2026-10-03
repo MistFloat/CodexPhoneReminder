@@ -17,6 +17,11 @@
 android/.android-sdk/
 android/local.properties
 
+# Release signing secrets: never commit. Losing the keystore means you can't
+# update the same applicationId on Google Play or via sideload.
+android/release.jks
+android/keystore.properties
+
 # Deployment secrets are created only on the VPS. Never commit them.
 .env
 .env.*
