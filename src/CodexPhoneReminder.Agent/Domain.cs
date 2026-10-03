@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace CodexPhoneReminder.Agent;
 
 public enum TaskState { Running, WaitingApproval, WaitingReply, Completed, Failed, Cancelled, Offline }
@@ -46,9 +48,20 @@ public sealed record PairClaim(string Code);
 public sealed record TaskReply(string Message, string? Model = null);
 public sealed record ProgressBatch(bool Active, DateTimeOffset LeaseExpiresAt, string State, IReadOnlyList<TimelineEvent> Events, string? NextCursor);
 public sealed record CliRunInfo(string Id, string ThreadId, string Status, DateTimeOffset StartedAt, DateTimeOffset? FinishedAt = null, int? ExitCode = null);
-public sealed record PairOffer(string Address, string Code, string Fingerprint, DateTimeOffset ExpiresAt);
+public sealed record PairOffer(string Address, string Code, string Fingerprint, DateTimeOffset ExpiresAt,
+    string? NetworkInterface = null, string? NetworkInterfaceType = null);
 public sealed record PairedDevice(string Id, string Name, DateTimeOffset PairedAt, DateTimeOffset LastSeenAt, bool Revoked = false);
-public sealed record PairResult(string Token, PairedDevice Device, string Fingerprint);
+/// <summary>
+/// The relay key is deliberately ignored by JSON.  It is only used while the
+/// pairing endpoint creates the one-time relay enrollment returned in <see cref="Relay"/>.
+/// </summary>
+public sealed record PairResult(
+    string Token,
+    PairedDevice Device,
+    string Fingerprint,
+    [property: JsonIgnore] string? RelayKey = null,
+    RelayPairing? Relay = null);
+public sealed record RelayPairing(string Url, string AgentId, string DeviceId, string DeviceToken, string Key);
 public sealed record NotificationSettings(bool Approval = true, bool WaitingReply = true, bool Completed = true,
     bool Failed = true, bool LongRunning = true, bool Offline = true, string QuietStart = "23:00", string QuietEnd = "07:00", int LongRunningMinutes = 30);
 public sealed class CodexCliOptions

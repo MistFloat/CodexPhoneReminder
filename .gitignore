@@ -6,6 +6,7 @@
 .codex-docs-cache/
 .openai-docs-cache/
 .verify/
+.verification/
 
 # Local Gradle distribution (not part of the repo)
 /gradle-9.5.0/
@@ -15,3 +16,7 @@
 **/.gradle*/
 android/.android-sdk/
 android/local.properties
+
+# Deployment secrets are created only on the VPS. Never commit them.
+.env
+.env.*

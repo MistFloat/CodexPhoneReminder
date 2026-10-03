@@ -1,6 +1,7 @@
 using CodexPhoneReminder.Agent;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.FileProviders;
+using System.Net.NetworkInformation;
 
 var failures = new List<string>();
 Check("secret redaction", AgentStore.Sanitize("token=abc123") == "token=***");
@@ -21,18 +22,38 @@ var firstLease = subscriptions.Renew("thread-1");
 var renewedLease = subscriptions.Renew("thread-1");
 Check("progress lease activates on demand", subscriptions.IsActive("thread-1") && firstLease.Active);
 Check("progress lease renewal keeps generation", firstLease.Generation == renewedLease.Generation && renewedLease.ExpiresAt >= firstLease.ExpiresAt);
+var selectedLan = LanAddressResolver.SelectBest([
+    new LanAddressCandidate("192.168.235.1", "VMware Network Adapter VMnet8", NetworkInterfaceType.Ethernet, false, true),
+    new LanAddressCandidate("172.18.112.1", "vEthernet (WSL)", NetworkInterfaceType.Ethernet, false, true),
+    new LanAddressCandidate("10.19.202.157", "WLAN", NetworkInterfaceType.Wireless80211, true, false)
+]);
+Check("WLAN address wins over virtual adapters", selectedLan?.Address == "10.19.202.157");
+var selectedEthernet = LanAddressResolver.SelectBest([
+    new LanAddressCandidate("172.18.112.1", "vEthernet (WSL)", NetworkInterfaceType.Ethernet, true, true),
+    new LanAddressCandidate("192.168.1.20", "Ethernet", NetworkInterfaceType.Ethernet, true, false)
+]);
+Check("physical Ethernet wins over virtual Ethernet", selectedEthernet?.Address == "192.168.1.20");
+var relayKey = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+var relayEnvelope = RelayEnvelopeCrypto.Encrypt(relayKey, "agent-a|device-a|request", "{\"method\":\"GET\"}");
+Check("relay envelope decrypts with matching AAD",
+    RelayEnvelopeCrypto.TryDecrypt(relayKey, "agent-a|device-a|request", relayEnvelope, out var relayPlaintext) && relayPlaintext == "{\"method\":\"GET\"}");
+Check("relay envelope rejects wrong AAD",
+    !RelayEnvelopeCrypto.TryDecrypt(relayKey, "agent-a|device-a|response", relayEnvelope, out _));
 var pairingRoot = Path.Combine(Path.GetTempPath(), "codex-reminder-pairing-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(pairingRoot);
 try
 {
     var environment = new TestEnvironment(pairingRoot);
-    var firstIdentity = new TransportIdentity(environment);
+    var firstIdentity = new TransportIdentity(environment, persistKey: false);
     var firstService = new PairingService(environment, firstIdentity);
     var offer = firstService.CreateOffer("https://127.0.0.1:5188#" + firstIdentity.Fingerprint);
     var claim = firstService.Claim(offer.Code);
-    var restartedIdentity = new TransportIdentity(environment);
+    var restartedIdentity = new TransportIdentity(environment, persistKey: false);
     var restartedService = new PairingService(environment, restartedIdentity);
     Check("paired token survives agent restart", claim is not null && restartedService.Validate(claim.Token));
+    Check("paired device receives a 256-bit relay key", claim?.RelayKey is { Length: > 40 });
+    Check("internal relay key is not serialized outside relay enrollment", claim is not null &&
+        !System.Text.Json.JsonSerializer.Serialize(claim).Contains("relayKey", StringComparison.OrdinalIgnoreCase));
     Check("TLS identity survives agent restart", firstIdentity.Fingerprint == restartedIdentity.Fingerprint && offer.Fingerprint.Length == 64);
 }
 finally { Directory.Delete(pairingRoot, true); }

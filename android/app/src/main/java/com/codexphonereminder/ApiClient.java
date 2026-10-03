@@ -3,21 +3,29 @@ package com.codexphonereminder;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.ConnectException;
 import java.net.HttpURLConnection;
+import java.net.NoRouteToHostException;
+import java.net.Proxy;
+import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 
 final class ApiClient {
     private final SecureStore store;
+    private volatile String lastTransport = "local";
     ApiClient(SecureStore store) { this.store = store; }
 
     JSONObject claim(String address, String code) throws Exception {
@@ -27,7 +35,10 @@ final class ApiClient {
             throw new IllegalArgumentException("请使用电脑配对页面提供的完整 HTTPS 地址");
         String origin = entered.getProtocol() + "://" + entered.getHost() +
             (entered.getPort() < 0 ? "" : ":" + entered.getPort()) + entered.getPath();
-        JSONObject result = new JSONObject(request(origin.replaceAll("/+$", "") + "/api/pair/claim", "POST",
+        // A pairing URL is deliberately always a direct pinned-TLS request.
+        // Cloud fallback becomes available only after this trusted response
+        // supplies relay credentials.
+        JSONObject result = new JSONObject(requestDirect(origin.replaceAll("/+$", "") + "/api/pair/claim", "POST",
             new JSONObject().put("code", code).toString(), null, pin));
         if (!pin.equalsIgnoreCase(result.optString("fingerprint"))) throw new CertificateException("电脑身份指纹不匹配");
         return result;
@@ -59,8 +70,35 @@ final class ApiClient {
         request(store.address() + "/api/tasks/" + id + "/archive", "POST", "{}", store.token(), store.fingerprint());
     }
 
+    String connectionMode() { return lastTransport; }
+
     private String request(String url, String method, String body, String token, String pin) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            String response = requestDirect(url, method, body, token, pin);
+            lastTransport = "local";
+            return response;
+        } catch (Exception localError) {
+            // Only connectivity failures may use the relay.  A failed TLS pin,
+            // rejected device token, or normal HTTP error must never be hidden
+            // by routing the request somewhere else.
+            SecureStore.RelayConfig relay = store.relay();
+            if (relay == null || !isLocalNetworkFailure(localError)) throw localError;
+            try {
+                String response = new RelayClient(relay).request(method, url, body);
+                lastTransport = "relay";
+                return response;
+            } catch (Exception relayError) {
+                relayError.addSuppressed(localError);
+                throw relayError;
+            }
+        }
+    }
+
+    private String requestDirect(String url, String method, String body, String token, String pin) throws Exception {
+        // The agent is a paired LAN endpoint. Do not send its address to an
+        // Android/system HTTP proxy, which cannot reach a private computer IP
+        // and would also defeat the direct pinned-TLS connection.
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection(Proxy.NO_PROXY);
         if (!(connection instanceof HttpsURLConnection)) throw new CertificateException("已拒绝不安全的 HTTP API 连接");
         HttpsURLConnection secure = (HttpsURLConnection) connection;
         SSLContext context = SSLContext.getInstance("TLS");
@@ -68,8 +106,12 @@ final class ApiClient {
         secure.setSSLSocketFactory(context.getSocketFactory());
         secure.setHostnameVerifier((hostname, session) -> true);
         connection.setRequestMethod(method);
-        connection.setConnectTimeout(5000);
-        connection.setReadTimeout(15000);
+        // Once a verified relay is paired, fail a blocked campus-LAN route
+        // quickly.  Normal local endpoints respond immediately; a retry via
+        // the cloud relay is preferable to leaving the UI frozen for 15 s.
+        boolean hasRelay = store.relay() != null;
+        connection.setConnectTimeout(hasRelay ? 2_000 : 5_000);
+        connection.setReadTimeout(hasRelay ? 4_000 : 15_000);
         connection.setUseCaches(false);
         connection.setRequestProperty("Accept", "application/json");
         connection.setRequestProperty("Cache-Control", "no-cache, no-store");
@@ -89,6 +131,21 @@ final class ApiClient {
         connection.disconnect();
         if (status < 200 || status >= 300) throw new ApiException(status, text.toString());
         return text.length() == 0 ? "{}" : text.toString();
+    }
+
+    private static boolean isLocalNetworkFailure(Throwable error) {
+        boolean networkError = false;
+        // Follow causes because Android often wraps connection and timeout
+        // exceptions while a certificate failure must remain terminal.
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            if (current instanceof ApiException || current instanceof CertificateException || current instanceof SSLException)
+                return false;
+            if (current instanceof ConnectException || current instanceof NoRouteToHostException ||
+                current instanceof UnknownHostException || current instanceof SocketTimeoutException)
+                networkError = true;
+            else if (current instanceof IOException) networkError = true;
+        }
+        return networkError;
     }
 
     private static final class PinTrustManager implements X509TrustManager {

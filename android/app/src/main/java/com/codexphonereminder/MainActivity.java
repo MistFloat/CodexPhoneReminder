@@ -114,7 +114,7 @@ public final class MainActivity extends Activity {
     private void showPairing() {
         currentTaskId = null; clear();
         title("连接电脑");
-        root.addView(body("电脑与手机需在同一局域网。先在电脑打开 /api/pair，再输入返回的完整 HTTPS 地址和 6 位配对码。地址末尾包含电脑证书指纹，请勿删减。"));
+        root.addView(body("首次配对时先在电脑打开 /api/pair，再输入完整 HTTPS 地址和 6 位配对码。地址末尾包含电脑证书指纹，请勿删减；电脑启用云中继后，后续连接会在本地不可达时自动回退。"));
         EditText address = input("安全代理地址，例如 https://192.168.1.10:5188#指纹");
         EditText code = input("6 位配对码");
         code.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
@@ -127,7 +127,7 @@ public final class MainActivity extends Activity {
             worker.execute(() -> {
                 try {
                     JSONObject result = api.claim(a, c);
-                    store.savePairing(a, result.getString("token"), result.optString("fingerprint"));
+                    store.savePairing(a, result.getString("token"), result.optString("fingerprint"), result.optJSONObject("relay"));
                     getSharedPreferences("notification_states", MODE_PRIVATE).edit().clear().apply();
                     runOnUiThread(() -> { busy(false); startMonitoring(); showTasks(); });
                 } catch (Exception e) { fail("配对失败", e); }
@@ -165,7 +165,8 @@ public final class MainActivity extends Activity {
                 JSONArray tasks = api.tasks();
                 runOnUiThread(() -> {
                     busy(false);
-                    status.setText("电脑在线 · CLI " + (health.optBoolean("cliAvailable") ? "可用" : "不可用") +
+                    status.setText("电脑在线 · " + ("relay".equals(api.connectionMode()) ? "云中继" : "本地直连") +
+                        " · CLI " + (health.optBoolean("cliAvailable") ? "可用" : "不可用") +
                         " · 已映射 " + health.optInt("mappedWorkspaces") + " 个工作区\n指纹 " + store.fingerprint());
                     renderTaskCards(tasks, status, taskList);
                     String requested = getIntent().getStringExtra(EXTRA_TASK_ID);
@@ -295,9 +296,11 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 JSONObject catalog = api.models();
+                JSONObject task = api.task(taskId);
                 JSONArray models = catalog.optJSONArray("models");
                 ArrayList<String> labels = new ArrayList<>(), ids = new ArrayList<>();
                 String defaultModel = catalog.optString("defaultModel");
+                String preferredModel = task.optString("preferredModel");
                 labels.add(defaultModel.isEmpty() ? "默认（电脑配置）" : "默认（" + defaultModel + "）"); ids.add("");
                 if (models != null) for (int i = 0; i < models.length(); i++) {
                     JSONObject item = models.optJSONObject(i); if (item == null) continue;
@@ -308,6 +311,8 @@ public final class MainActivity extends Activity {
                     if (destroyed || generation != taskViewGeneration || !taskId.equals(currentTaskId)) return;
                     spinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels));
                     spinner.setTag(ids);
+                    int selected = ids.indexOf(preferredModel);
+                    if (selected >= 0) spinner.setSelection(selected);
                 });
             } catch (Exception error) {
                 runOnUiThread(() -> {

@@ -1,4 +1,3 @@
-using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -7,13 +6,21 @@ using CodexPhoneReminder.Agent;
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
-builder.WebHost.UseUrls(builder.Configuration["Agent:Urls"] ?? "http://0.0.0.0:5187");
+var httpPort = builder.Configuration.GetValue("Agent:HttpPort", 5187);
+var httpsPort = builder.Configuration.GetValue("Agent:HttpsPort", 5188);
 var transportIdentity = new TransportIdentity(builder.Environment);
 builder.WebHost.ConfigureKestrel(options =>
-    options.ConfigureHttpsDefaults(https => https.ServerCertificate = transportIdentity.Certificate));
+{
+    options.ListenAnyIP(httpPort);
+    options.ListenAnyIP(httpsPort, listen => listen.UseHttps(transportIdentity.Certificate));
+});
 builder.Services.AddSingleton<AgentStore>();
 builder.Services.AddSingleton(transportIdentity);
+builder.Services.AddSingleton<LanAddressResolver>();
 builder.Services.AddSingleton<PairingService>();
+builder.Services.Configure<CloudRelayOptions>(builder.Configuration.GetSection("Relay"));
+builder.Services.AddSingleton<CloudRelayClient>();
+builder.Services.AddHostedService<CloudRelayWorker>();
 builder.Services.AddSingleton<CodexModelCatalog>();
 builder.Services.Configure<CodexCliOptions>(builder.Configuration.GetSection("CodexCli"));
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));
@@ -32,7 +39,7 @@ app.Use(async (context, next) =>
     if (!context.Request.IsHttps && !insecurePairOffer && !insecureDownload)
     {
         var host = context.Request.Host.Host;
-        context.Response.Redirect($"https://{host}:5188{context.Request.Path}{context.Request.QueryString}");
+        context.Response.Redirect($"https://{host}:{httpsPort}{context.Request.Path}{context.Request.QueryString}");
         return;
     }
     await next();
@@ -47,18 +54,26 @@ app.Use(async (context, next) =>
         context.Request.Path == "/api/health")
     { await next(); return; }
     var pairing = context.RequestServices.GetRequiredService<PairingService>();
+    var relay = context.RequestServices.GetRequiredService<CloudRelayClient>();
+    if (relay.IsInternalRelayRequest(context)) { await next(); return; }
     if (!context.Request.Headers.TryGetValue("X-Device-Token", out var token) || !pairing.Validate(token!))
     { context.Response.StatusCode = 401; await context.Response.WriteAsJsonAsync(new { error = "设备未配对或授权已撤销" }); return; }
     await next();
 });
 
-app.MapGet("/api/health", (AgentStore store, CodexCliLocator locator, CodexWorkspaceRegistry workspaces) => Results.Ok(new
+app.MapGet("/api/health", (AgentStore store, CodexCliLocator locator, CodexWorkspaceRegistry workspaces, LanAddressResolver lanAddresses, CloudRelayClient relay) =>
+{
+    var lan = lanAddresses.Resolve();
+    return Results.Ok(new
 {
     status = "online", computerName = Environment.MachineName, version = "0.1.0",
     source = "codex-cli", reliability = "structured-session", lastSyncAt = store.LastActivity,
     cliAvailable = locator.ResolvedPath is not null, cliPath = locator.DisplayPath,
-    mappedWorkspaces = workspaces.Count
-}));
+    mappedWorkspaces = workspaces.Count, lanAddress = lan.Address,
+    lanInterface = lan.InterfaceName, lanInterfaceType = lan.InterfaceType,
+    relay = relay.Status
+});
+});
 
 app.MapGet("/downloads/android-debug.apk", (IWebHostEnvironment env) =>
 {
@@ -68,15 +83,30 @@ app.MapGet("/downloads/android-debug.apk", (IWebHostEnvironment env) =>
         : Results.NotFound(new { error = "Android debug APK 尚未构建，请先在 android 目录运行 gradlew.bat assembleDebug" });
 });
 
-app.MapGet("/api/pair", (HttpContext ctx, PairingService pairing, TransportIdentity transport) =>
+app.MapGet("/api/pair", (PairingService pairing, TransportIdentity transport, LanAddressResolver lanAddresses, ILogger<Program> logger) =>
 {
-    var host = ctx.Request.Host.Host;
-    if (host is "localhost" or "127.0.0.1") host = LocalAddress();
-    return Results.Ok(pairing.CreateOffer($"https://{host}:5188#{transport.Fingerprint}"));
+    var lan = lanAddresses.Resolve();
+    logger.LogInformation("Pairing address selected: {Address} via {Interface} ({InterfaceType})", lan.Address, lan.InterfaceName, lan.InterfaceType);
+    return Results.Ok(pairing.CreateOffer($"https://{lan.Address}:{httpsPort}#{transport.Fingerprint}", lan.InterfaceName, lan.InterfaceType));
 });
 
-app.MapPost("/api/pair/claim", (PairClaim claim, PairingService pairing) =>
-    pairing.Claim(claim.Code) is { } result ? Results.Ok(result) : Results.BadRequest(new { error = "配对码无效或已过期" }));
+app.MapPost("/api/pair/claim", async (PairClaim claim, PairingService pairing, CloudRelayClient relay, ILogger<Program> logger, CancellationToken ct) =>
+{
+    var result = pairing.Claim(claim.Code);
+    if (result is null) return Results.BadRequest(new { error = "配对码无效或已过期" });
+    try
+    {
+        var enrollment = await relay.EnrollDeviceAsync(result, ct);
+        if (enrollment is not null) result = result with { Relay = enrollment };
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+    catch (Exception ex)
+    {
+        // A LAN pairing must remain usable when a currently optional relay is offline.
+        logger.LogWarning(ex, "Local pairing succeeded but cloud relay enrollment was unavailable");
+    }
+    return Results.Ok(result);
+});
 
 app.MapGet("/api/tasks", (AgentStore store) => Results.Ok(store.Tasks()));
 app.MapGet("/api/models", (CodexModelCatalog models) => Results.Ok(models.Get()));
@@ -140,8 +170,5 @@ app.MapGet("/api/devices", (PairingService pairing) => Results.Ok(pairing.Device
 app.MapDelete("/api/devices/{id}", (string id, PairingService pairing) => pairing.Revoke(id) ? Results.NoContent() : Results.NotFound());
 app.MapFallbackToFile("index.html");
 app.Run();
-
-static string LocalAddress() => Dns.GetHostEntry(Dns.GetHostName()).AddressList
-    .FirstOrDefault(x => x.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IPAddress.IsLoopback(x))?.ToString() ?? "127.0.0.1";
 
 public partial class Program { }
